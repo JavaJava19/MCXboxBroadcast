@@ -2,22 +2,27 @@ package com.rtm516.mcxboxbroadcast.bootstrap.geyser;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import com.rtm516.mcxboxbroadcast.core.FriendUtils;
 import com.rtm516.mcxboxbroadcast.core.Logger;
 import com.rtm516.mcxboxbroadcast.core.SessionInfo;
 import com.rtm516.mcxboxbroadcast.core.SessionManager;
+import com.rtm516.mcxboxbroadcast.core.configs.ExtensionConfig;
 import com.rtm516.mcxboxbroadcast.core.exceptions.SessionCreationException;
 import com.rtm516.mcxboxbroadcast.core.exceptions.SessionUpdateException;
 import com.rtm516.mcxboxbroadcast.core.exceptions.XboxFriendsException;
 import com.rtm516.mcxboxbroadcast.core.models.FollowerResponse;
-import org.geysermc.api.Geyser;
-import org.geysermc.common.PlatformType;
 import org.geysermc.event.subscribe.Subscribe;
 import org.geysermc.floodgate.util.Utils;
 import org.geysermc.floodgate.util.WhitelistUtils;
 import org.geysermc.geyser.GeyserImpl;
+import org.geysermc.geyser.api.command.Command;
+import org.geysermc.geyser.api.command.CommandSource;
+import org.geysermc.geyser.api.connection.GeyserConnection;
+import org.geysermc.geyser.api.event.lifecycle.GeyserDefineCommandsEvent;
 import org.geysermc.geyser.api.event.lifecycle.GeyserPostInitializeEvent;
 import org.geysermc.geyser.api.extension.Extension;
 import org.geysermc.geyser.api.network.AuthType;
+import org.geysermc.geyser.api.util.PlatformType;
 
 import java.io.File;
 import java.io.FileWriter;
@@ -32,6 +37,7 @@ import java.nio.file.FileSystem;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.util.Collections;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 public class MCXboxBroadcastExtension implements Extension {
@@ -39,6 +45,50 @@ public class MCXboxBroadcastExtension implements Extension {
     SessionManager sessionManager;
     SessionInfo sessionInfo;
     ExtensionConfig config;
+    private ScheduledFuture<?> updateTimerScheduledFuture;
+    private ScheduledFuture<?> friendTimerScheduledFuture;
+
+    @Subscribe
+    public void onCommandDefine(GeyserDefineCommandsEvent event) {
+        event.register(Command.builder(this)
+            .source(CommandSource.class)
+            .name("restart")
+            .description("Restart the connection to Xbox Live.")
+            .executor((source, command, args) -> {
+                if (!source.isConsole()) {
+                    source.sendMessage("This command can only be ran from the console.");
+                    return;
+                }
+
+                sessionManager.stopSession();
+
+                if (updateTimerScheduledFuture != null) {
+                    updateTimerScheduledFuture.cancel(true);
+                }
+                if (friendTimerScheduledFuture != null) {
+                    friendTimerScheduledFuture.cancel(true);
+                }
+
+                sessionManager = new SessionManager(this.dataFolder().toString(), logger);
+
+                createSession();
+            })
+            .build());
+
+        event.register(Command.builder(this)
+            .source(CommandSource.class)
+            .name("dumpsession")
+            .description("Dump the current session to json files.")
+            .executor((source, command, args) -> {
+                if (!source.isConsole()) {
+                    source.sendMessage("This command can only be ran from the console.");
+                    return;
+                }
+
+                sessionManager.dumpSession();
+            })
+            .build());
+    }
 
     @Subscribe
     public void onPostInitialize(GeyserPostInitializeEvent event) {
@@ -76,10 +126,10 @@ public class MCXboxBroadcastExtension implements Extension {
 
         // Pull onto another thread so we don't hang the main thread
         new Thread(() -> {
-            logger.info("Setting up Xbox session...");
+            logger.info("Setting up session info...");
 
             // Get the ip to broadcast
-            String ip = config.remoteAddress;
+            String ip = config.remoteAddress();
             if (ip.equals("auto")) {
                 // Taken from core Geyser code
                 ip = this.geyserApi().bedrockListener().address();
@@ -99,8 +149,8 @@ public class MCXboxBroadcastExtension implements Extension {
 
             // Get the port to broadcast
             int port = this.geyserApi().bedrockListener().port();
-            if (!config.remotePort.equals("auto")) {
-                port = Integer.parseInt(config.remotePort);
+            if (!config.remotePort().equals("auto")) {
+                port = Integer.parseInt(config.remotePort());
             }
 
             // Create the session information based on the Geyser config
@@ -115,18 +165,28 @@ public class MCXboxBroadcastExtension implements Extension {
             sessionInfo.setIp(ip);
             sessionInfo.setPort(port);
 
-            // Create the Xbox session
-            try {
-                sessionManager.createSession(sessionInfo);
-                logger.info("Created Xbox session!");
-            } catch (SessionCreationException | SessionUpdateException e) {
-                logger.error("Failed to create xbox session!", e);
-                return;
-            }
-
-            // Start the update timer
-            GeyserImpl.getInstance().getScheduledThread().scheduleWithFixedDelay(this::tick, config.updateInterval, config.updateInterval, TimeUnit.SECONDS); // TODO Find API equivalent
+            createSession();
         }).start();
+    }
+
+    private void createSession() {
+        // Create the Xbox session
+        try {
+            logger.info("Setting up Xbox session...");
+            sessionManager.createSession(sessionInfo);
+            logger.info("Created Xbox session!");
+        } catch (SessionCreationException | SessionUpdateException e) {
+            logger.error("Failed to create xbox session!", e);
+            return;
+        }
+
+        // Start the update timer
+        updateTimerScheduledFuture = GeyserImpl.getInstance().getScheduledThread().scheduleWithFixedDelay(this::tick, config.updateInterval(), config.updateInterval(), TimeUnit.SECONDS); // TODO Find API equivalent
+
+        // Start a timer for the friend sync if enabled
+        if (config.friendSync().autoFollow() || config.friendSync().autoUnfollow()) {
+            friendTimerScheduledFuture = GeyserImpl.getInstance().getScheduledThread().scheduleAtFixedRate(() -> FriendUtils.autoFriend(sessionManager, logger, config.friendSync()), config.friendSync().updateInterval(), config.friendSync().updateInterval(), TimeUnit.SECONDS);
+        }
     }
 
     private void tick() {
@@ -144,8 +204,8 @@ public class MCXboxBroadcastExtension implements Extension {
         // If we are in spigot, using floodgate authentication and have the config option enabled
         // get the users friends and whitelist them
         if (this.geyserApi().defaultRemoteServer().authType() == AuthType.FLOODGATE
-            && GeyserImpl.getInstance().getPlatformType() == PlatformType.SPIGOT // TODO Find API equivalent
-            && config.whitelistFriends) {
+                && this.geyserApi().platformType() == PlatformType.SPIGOT // TODO Find API equivalent
+                && config.whitelistFriends()) {
             try {
                 for (FollowerResponse.Person person : sessionManager.getXboxFriends()) {
                     if (WhitelistUtils.addPlayer(Utils.getJavaUuid(person.xuid), "unknown")) {

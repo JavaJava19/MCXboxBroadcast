@@ -10,6 +10,7 @@ import com.rtm516.mcxboxbroadcast.core.models.FollowerResponse;
 import com.rtm516.mcxboxbroadcast.core.models.XboxTokenInfo;
 
 import java.io.File;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -30,9 +31,12 @@ public class SessionManager {
     private final XboxTokenManager xboxTokenManager;
     private final HttpClient httpClient;
     private final Logger logger;
+    private final String cache;
 
     private RtaWebsocketClient rtaWebsocket;
     private ExpandedSessionInfo sessionInfo;
+
+    private String lastSessionResponse;
 
     /**
      * Create an instance of SessionManager using default values
@@ -63,6 +67,7 @@ public class SessionManager {
             .build();
 
         this.logger = logger;
+        this.cache = cache;
 
         this.liveTokenManager = new LiveTokenManager(cache, httpClient, logger);
         this.xboxTokenManager = new XboxTokenManager(cache, httpClient, logger);
@@ -205,6 +210,7 @@ public class SessionManager {
         // Check to make sure the handle was created
         logger.info("セッションハンドルの作成を確認します");
         if (createHandleResponse.statusCode() != 200 && createHandleResponse.statusCode() != 201) {
+            logger.debug("Failed to create session handle '"  + createHandleResponse.body() + "' (" + createHandleResponse.statusCode() + ")");
             throw new SessionCreationException("Unable to create session handle, got status " + createHandleResponse.statusCode() + " trying to create");
         }
     }
@@ -248,8 +254,10 @@ public class SessionManager {
             throw new SessionUpdateException(e.getMessage());
         }
 
+        lastSessionResponse = createSessionResponse.body();
+
         if (createSessionResponse.statusCode() != 200 && createSessionResponse.statusCode() != 201) {
-            logger.debug("Got session response: " + createSessionResponse.body());
+            logger.debug("Got session response: " + lastSessionResponse);
             throw new SessionUpdateException("Unable to update session information, got status " + createSessionResponse.statusCode() + " trying to update");
         }
     }
@@ -432,5 +440,41 @@ public class SessionManager {
     private void setupWebsocket(String token) {
         rtaWebsocket = new RtaWebsocketClient(token, logger);
         rtaWebsocket.connect();
+    }
+
+    public void stopSession() {
+        rtaWebsocket.close();
+        this.sessionInfo.setSessionId(null);
+    }
+
+    public void dumpSession() {
+        logger.info("Dumping current and last session responses");
+        try {
+            FileWriter file = new FileWriter(this.cache + "/lastSessionResponse.json");
+            file.write(lastSessionResponse);
+            file.close();
+        } catch (IOException e) {
+            logger.error("Error dumping last session: " + e.getMessage());
+        }
+
+        HttpRequest createSessionRequest = HttpRequest.newBuilder()
+                .uri(URI.create(Constants.CREATE_SESSION + this.sessionInfo.getSessionId()))
+                .header("Content-Type", "application/json")
+                .header("Authorization", getTokenHeader())
+                .header("x-xbl-contract-version", "107")
+                .GET()
+                .build();
+
+        try {
+            HttpResponse<String> createSessionResponse = httpClient.send(createSessionRequest, HttpResponse.BodyHandlers.ofString());
+
+            FileWriter file = new FileWriter(this.cache + "/currentSessionResponse.json");
+            file.write(createSessionResponse.body());
+            file.close();
+        } catch (IOException | InterruptedException e) {
+            logger.error("Error dumping current session: " + e.getMessage());
+        }
+
+        logger.info("Dumped session responses to 'lastSessionResponse.json' and 'currentSessionResponse.json'");
     }
 }

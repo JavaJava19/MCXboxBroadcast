@@ -4,21 +4,19 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import com.nukkitx.protocol.bedrock.BedrockClient;
 import com.nukkitx.protocol.bedrock.BedrockPong;
-import com.rtm516.mcxboxbroadcast.core.Logger;
+import com.rtm516.mcxboxbroadcast.core.FriendUtils;
 import com.rtm516.mcxboxbroadcast.core.SessionInfo;
 import com.rtm516.mcxboxbroadcast.core.SessionManager;
+import com.rtm516.mcxboxbroadcast.core.configs.StandaloneConfig;
+import com.rtm516.mcxboxbroadcast.core.exceptions.SessionCreationException;
 import com.rtm516.mcxboxbroadcast.core.exceptions.SessionUpdateException;
-import com.rtm516.mcxboxbroadcast.core.exceptions.XboxFriendsException;
-import com.rtm516.mcxboxbroadcast.core.models.FollowerResponse;
 import org.java_websocket.util.NamedThreadFactory;
 import org.slf4j.LoggerFactory;
-import org.slf4j.impl.SimpleLogger;
 
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -27,12 +25,14 @@ import java.util.concurrent.TimeUnit;
 
 public class StandaloneMain {
     private static StandaloneConfig config;
-    private static Logger logger;
+    private static StandaloneLoggerImpl logger;
+    private static SessionInfo sessionInfo;
+    private static ScheduledExecutorService scheduledThreadPool;
+
+    public static SessionManager sessionManager;
 
     public static void main(String[] args) throws Exception {
         logger = new StandaloneLoggerImpl(LoggerFactory.getLogger(StandaloneMain.class));
-
-        ScheduledExecutorService scheduledThreadPool = Executors.newScheduledThreadPool(2, new NamedThreadFactory("Scheduled Thread"));
 
         String configFileName = "config.yml";
         File configFile = new File(configFileName);
@@ -63,19 +63,31 @@ public class StandaloneMain {
             return;
         }
 
-        // Use reflection to put the logger in debug mode
-        if (config.debugLog) {
-            Field currentLogLevel = SimpleLogger.class.getDeclaredField("currentLogLevel");
-            currentLogLevel.setAccessible(true);
-            currentLogLevel.set(LoggerFactory.getLogger(StandaloneMain.class), 10);
-        }
+        logger.setDebug(config.debugLog());
 
-        SessionManager sessionManager = new SessionManager("./cache", logger);
+        sessionManager = new SessionManager("./cache", logger);
 
-        SessionInfo sessionInfo = config.sessionConfig.sessionInfo;
+        sessionInfo = config.session().sessionInfo();
 
         // Sync the session info from the server if needed
         updateSessionInfo(sessionInfo);
+
+        createSession();
+
+        logger.start();
+    }
+
+    public static void restart() throws SessionUpdateException, SessionCreationException {
+        sessionManager.stopSession();
+        scheduledThreadPool.shutdown();
+
+        sessionManager = new SessionManager("./cache", logger);
+
+        createSession();
+    }
+
+    private static void createSession() throws SessionCreationException, SessionUpdateException {
+        scheduledThreadPool = Executors.newScheduledThreadPool(2, new NamedThreadFactory("Scheduled Thread"));
 
         logger.info("Creating session...");
 
@@ -96,33 +108,15 @@ public class StandaloneMain {
             } catch (SessionUpdateException e) {
                 logger.error("Failed to update session", e);
             }
-        }, config.sessionConfig.updateInterval, config.sessionConfig.updateInterval, TimeUnit.SECONDS);
+        }, config.session().updateInterval(), config.session().updateInterval(), TimeUnit.SECONDS);
 
-        if (config.friendSyncConfig.autoFollow || config.friendSyncConfig.autoUnfollow) {
-            scheduledThreadPool.scheduleWithFixedDelay(() -> {
-                try {
-                    for (FollowerResponse.Person person : sessionManager.getXboxFriends(config.friendSyncConfig.autoFollow, config.friendSyncConfig.autoUnfollow)) {
-                        // Follow the person back
-                        if (config.friendSyncConfig.autoFollow && person.isFollowingCaller && !person.isFollowedByCaller) {
-                            logger.info("Added " + person.displayName + " (" + person.xuid + ") as a friend");
-                            sessionManager.addXboxFriend(person.xuid);
-                        }
-
-                        // Unfollow the person
-                        if (config.friendSyncConfig.autoUnfollow && !person.isFollowingCaller && person.isFollowedByCaller) {
-                            logger.info("Removed " + person.displayName + " (" + person.xuid + ") as a friend");
-                            sessionManager.removeXboxFriend(person.xuid);
-                        }
-                    }
-                } catch (XboxFriendsException e) {
-                    logger.error("Failed to sync friends", e);
-                }
-            }, config.friendSyncConfig.updateInterval, config.friendSyncConfig.updateInterval, TimeUnit.SECONDS);
+        if (config.friendSync().autoFollow() || config.friendSync().autoUnfollow()) {
+            scheduledThreadPool.scheduleWithFixedDelay(() -> FriendUtils.autoFriend(sessionManager, logger, config.friendSync()), config.friendSync().updateInterval(), config.friendSync().updateInterval(), TimeUnit.SECONDS);
         }
     }
 
     private static void updateSessionInfo(SessionInfo sessionInfo) {
-        if (config.sessionConfig.queryServer) {
+        if (config.session().queryServer()) {
             BedrockClient client = null;
             try {
                 InetSocketAddress bindAddress = new InetSocketAddress("0.0.0.0", 0);
